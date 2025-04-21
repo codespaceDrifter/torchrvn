@@ -1,0 +1,8 @@
+numpy
+notebook
+torch
+pandas
+datasets
+matplotlib
+torchviz
+pillow
