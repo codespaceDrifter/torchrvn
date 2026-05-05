@@ -9,3 +9,4 @@ pillow
 datasets
 huggingface_hub
 hf_xet
+plotify

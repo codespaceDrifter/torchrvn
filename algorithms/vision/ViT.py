@@ -116,7 +116,7 @@ class VisionProjector(nn.Module):
         return x
 
 
-class ViT(nn.Module):
+class VLM(nn.Module):
     def __init__(self, ViT, projector, llm):
         super().__init__()
         self.ViT = ViT

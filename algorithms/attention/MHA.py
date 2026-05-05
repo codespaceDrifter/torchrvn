@@ -9,7 +9,6 @@ class MultiHeadAttention(nn.Module):
         self.d_model = d_model
         self.num_heads = num_heads
         self.d_k = d_model // num_heads
-        self.d_k_tensor = torch.tensor(d_model // num_heads, dtype=torch.float32).cuda()
         
         # Linear layers for Q, K, V projections
         self.W_q = nn.Linear(d_model, d_model)
@@ -22,7 +21,7 @@ class MultiHeadAttention(nn.Module):
 
 
         # (batch, heads, Q_seq_len, d_k) x (batch, heads, d_k, K_seq_len) -> (batch, heads, Q_seq_len, K_seq_len)
-        attention_scores = torch.matmul(Q, K.transpose(-2, -1)) / torch.sqrt(self.d_k_tensor)
+        attention_scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.d_k ** 0.5)
 
         
         if mask is not None:

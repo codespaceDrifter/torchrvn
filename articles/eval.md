@@ -15,7 +15,7 @@ precision: among the predicted positives how many are actually positive
 
 recall: all the actually positive things how many are predicted as positive
 
-> Recall = TP / (TP + TN)
+> Recall = TP / (TP + FN)
 
 F1 score: weighted average of precision and recall. more useful than accuracy especially with uneven class distribution
 

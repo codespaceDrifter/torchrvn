@@ -7,8 +7,40 @@ import random
 import torch
 import os
 import numpy as np
+import matplotlib.pyplot as plt
 
 from utils.training.saves import cleanup_checkpoints, load_latest_checkpoint, save_checkpoint
+
+
+def plot_quiz_history(quiz_history, save_dir):
+    # quiz_history: [(batch_idx, {lesson: loss, ...}), ...]
+    if not quiz_history:
+        return
+
+    plt.figure(figsize=(10, 6))
+
+    # collect all unique lessons across all entries, preserve order
+    all_lessons = []
+    for _, losses_dict in quiz_history:
+        for lesson in losses_dict:
+            if lesson not in all_lessons:
+                all_lessons.append(lesson)
+
+    cmap = plt.cm.get_cmap('hsv', len(all_lessons) + 1)
+
+    for i, lesson in enumerate(all_lessons):
+        batches = [b for b, losses_dict in quiz_history if lesson in losses_dict]
+        losses = [losses_dict[lesson] for _, losses_dict in quiz_history if lesson in losses_dict]
+        plt.plot(batches, losses, marker='o', markersize=3, label=lesson, color=cmap(i))
+
+    plt.xlabel("batch")
+    plt.ylabel("loss")
+    plt.ylim(0, 10)
+    plt.yticks(range(11))
+    plt.title("quiz loss per lesson")
+    plt.legend(bbox_to_anchor=(1.02, 1), loc='upper left')
+    plt.savefig(os.path.join(save_dir, "loss.png"), dpi=150, bbox_inches='tight')
+    plt.close()
 
 
 class Curriculum:
@@ -129,7 +161,7 @@ def quiz_until_mix_full(model, curriculum, batch_size, quiz_batches, acceptable_
 
             if loss >= acceptable_loss:
                 all_passed = False
-                raw = min(1.0, (loss - acceptable_loss) / acceptable_loss)
+                raw = min(1.0, ((loss - acceptable_loss) / acceptable_loss) ** 0.5)
                 # cap so we don't exceed 1.0 total
                 take = min(raw, remaining)
                 lesson_to_mix[lesson] = take
@@ -202,11 +234,11 @@ def train_curriculum(
         print(f"{l}: {curriculum.sizes[l]} samples")
     print(f"Total: {sum(curriculum.sizes.values())} samples")
 
+    meta = load_latest_checkpoint(save_folder_path, model, optimizer, scheduler)
     # quiz_history: [(batch_idx, {lesson: loss, ...}), ...]
-    last_batch, quiz_history, prev_train_time = load_latest_checkpoint(
-        save_folder_path, model, optimizer, scheduler
-    )
-    batch_idx = last_batch
+    batch_idx = meta.get('batch', 0) if meta else 0
+    quiz_history = meta.get('quiz_history', []) if meta else []
+    prev_train_time = meta.get('total_train_time', 0.0) if meta else 0.0
     session_start_time = time.time()
     streak = 0
 
@@ -284,7 +316,10 @@ def train_curriculum(
                     print(f"\nTraining complete - {stop_streak} consecutive passes!")
                     path = f"{save_folder_path}/batch_{batch_idx}.pt"
                     total_time = prev_train_time + (time.time() - session_start_time)
-                    save_checkpoint(path, model, optimizer, batch_idx, quiz_history, total_time, scheduler)
+                    meta = {'batch': batch_idx, 'quiz_history': quiz_history, 'total_train_time': total_time}
+                    save_checkpoint(path, model, optimizer, meta, scheduler)
+                    meta_dir = os.path.join(save_folder_path, "metadata")
+                    plot_quiz_history(quiz_history, meta_dir)
                     return
             else:
                 if streak > 0:
@@ -298,6 +333,9 @@ def train_curriculum(
         if batch_idx % batches_per_save == 0:
             path = f"{save_folder_path}/batch_{batch_idx}.pt"
             total_time = prev_train_time + (time.time() - session_start_time)
-            save_checkpoint(path, model, optimizer, batch_idx, quiz_history, total_time, scheduler)
+            meta = {'batch': batch_idx, 'quiz_history': quiz_history, 'total_train_time': total_time}
+            save_checkpoint(path, model, optimizer, meta, scheduler)
+            meta_dir = os.path.join(save_folder_path, "metadata")
+            plot_quiz_history(quiz_history, meta_dir)
             print(f"Saved: {path}")
             cleanup_checkpoints(save_folder_path)
