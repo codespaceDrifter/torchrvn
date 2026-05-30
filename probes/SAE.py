@@ -1,96 +1,77 @@
-# to implement: jump relu. disable band. detach trick for backprop?
-
 import torch
 import torch.nn as nn
 
-"""
-Localized SAE.
-Top K selection. set k = 0 to not use it.
-Loss has recon and sparsity. set sparsity = 0 to not use it.
-Usually we either use top k or sparsity loss
+# jumprelu, upper lower bound, cone gate, l0 loss  
 
-Each band is a learned center c_i (prototype vector) with bandwidth sigma_i.
-how many (distance/bandwith)^2 from center
-
-decoder is unit normed. shaped (num_features, d_model) so each ROW is a feature
-
-Activation: z_i = exp(-||x - c_i||^2 / sigma_i^2), kept only if in top-k per input.
-Reconstruction: x_hat = z @ W_dec (a learned Linear, no bias, not tied to centers).
-"""
-
-class SAE(nn.Module):
-    def __init__(self, d_model: int, expansion: int, k: int = 0):
+class SAE (nn.Module):
+    def __init__(self, embed_dim, expansion_factor, band_eps = 0.001):
         super().__init__()
-        self.d_model = d_model
-        self.num_features = d_model * expansion
-        self.k = k
+        self.embed_dim = embed_dim
+        self.feature_dim = embed_dim * expansion_factor
+        self.band_eps = band_eps
 
-        # centers: (num_features, d_model) - prototype vectors, magnitude meaningful
-        self.centers = nn.Parameter(torch.randn(self.num_features, d_model) * 0.1)
-        # ln_sigma for positivity; (num_features,). always exp before using.
-        self.ln_sigma = nn.Parameter(torch.zeros(self.num_features))
-        # encoder
-        self.encoder = nn.Linear (d_model, self.num_features)
-        # decoder: (num_features, d_model) - each row = one feature's reconstruction direction. unit-normed on-the-fly in decode.
-        # init: random direction on unit sphere in d_model-space
-        W_dec_init = torch.randn(self.num_features, d_model)
-        W_dec_init = W_dec_init / W_dec_init.norm(dim=-1, keepdim=True)
-        self.W_dec = nn.Parameter(W_dec_init)
+        # dictionary weights
+        self.encoder_weight = nn.Parameter(torch.randn(self.feature_dim, self.embed_dim) / self.embed_dim ** 0.5) # (out, in) format
+        self.encoder_bias = nn.Parameter(torch.randn(self.feature_dim) / self.embed_dim ** 0.5)
+        self.decoder_weight = nn.Parameter(torch.randn(self.embed_dim, self.feature_dim) / self.embed_dim ** 0.5)
+        self.decoder_bias = nn.Parameter(torch.randn(self.embed_dim) / self.embed_dim ** 0.5)
 
-    # (batch, d_model) -> (batch, num_features)
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
-        # gating
-        # ||x - c||^2 = ||x||^2 + ||c||^2 - 2 x.c -- avoids materializing (batch, num_features, d_model)
-        # (batch, 1)
-        x_sq = (x ** 2).sum(dim=-1, keepdim=True)
-        # (1, num_features)
-        c_sq = (self.centers ** 2).sum(dim=-1).unsqueeze(0)
-        # (batch, d_model) @ (d_model, num_features) -> (batch, num_features)
-        xc = x @ self.centers.t()
-        # (batch, num_features); clamp for fp cancellation when x ~ c
-        sq_dist = (x_sq + c_sq - 2 * xc).clamp(min=0)
-        # (num_features,)
-        sigma_sq = torch.exp (self.ln_sigma) ** 2
-        # (batch,num_features)
-        gate_scale = torch.exp( - (sq_dist / sigma_sq))
+        # gate weights
+        self.slab_gate_lower_bound = nn.Parameter(torch.zeros(self.feature_dim,))
+        self.slab_gate_upper_bound = nn.Parameter(torch.full((self.feature_dim,), 10.0))
+        self.cone_gate_upper_bound = nn.Parameter(torch.full((self.feature_dim,), 1.57)) # initalize to right angle
 
-        # encoder raw
-        # (batch, num_features)
-        encoder_raw = torch.relu(self.encoder(x))
 
-        # z full
-        # (batch, num_features)
-        z_full =  encoder_raw * gate_scale
+    # straight through estimator
+    # we want to use hard for forward but use soft estimator for backprop
+    def ste_gate (self, arg, threshhold, lower_bound):
+        if lower_bound == True:
+            hard = (arg >= threshhold).float()
+            smooth = torch.sigmoid ((arg - threshhold) / self.band_eps)
+        else:
+            hard = (arg < threshhold).float()
+            smooth = torch.sigmoid ((threshhold - arg) / self.band_eps)
+        # forward value = hard, backward due to detach gradient uses soft
+        return smooth + (hard - smooth).detach()
 
-        # top k mask
-        if self.k == 0:
-            return z_full
-        # (batch, k).
-        # top k and scatter uses the indexing format: the collapsed dimension is specified through value
-        topk_vals, topk_idx = z_full.topk(self.k, dim = -1)
-        z = torch.zeros_like (z_full)
-        z.scatter_(dim = -1, index=topk_idx, src=topk_vals)
-        return z
+    def encode (self, input):
+        pre_gate_features = (input - self.decoder_bias) @ self.encoder_weight.T + self.encoder_bias
 
-    def decode(self, z: torch.Tensor) -> torch.Tensor:
-        # (num_features, d_model) with unit-norm rows; gradient flows through the normalization
-        W = self.W_dec / self.W_dec.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-        # (batch, num_features) @ (num_features, d_model) -> (batch, d_model)
-        return z @ W
+        slab_lower_gate = self.ste_gate(pre_gate_features, self.slab_gate_lower_bound, True)
+        slab_upper_gate = self.ste_gate(pre_gate_features,self.slab_gate_upper_bound, False)
+        angles = torch.acos(
+            ((input - self.decoder_bias) @ self.encoder_weight.T 
+            / (input - self.decoder_bias).norm(dim=-1, keepdim=True) / self.encoder_weight.norm(dim=-1))
+            .clamp(-1 + 1e-5, 1- 1e-5))
+        cone_upper_gate = self.ste_gate(angles, self.cone_gate_upper_bound, False)
+        combined_gate = slab_lower_gate * slab_upper_gate * cone_upper_gate
 
-    def forward(self, x: torch.Tensor):
-        z = self.encode(x)
-        x_hat = self.decode(z)
-        return x_hat, z
+        features = pre_gate_features * combined_gate
+        return features, combined_gate
 
-    # pass sparsity_w=0.0 to skip sparsity loss entirely (no graph built, no VRAM held)
-    def loss(self, x: torch.Tensor, recon_w: float = 1.0, sparsity_w: float = 0.0) -> dict:
-        x_hat, z = self.forward(x)
-        # (batch, d_model) -> scalar
-        recon = ((x - x_hat) ** 2).sum(dim=-1).mean()
-        loss = recon_w * recon
-        if sparsity_w > 0:
-            # (batch, num_features) -> scalar; L1 on activations (z >= 0 from ReLU)
-            sparsity = z.sum(dim=-1).mean()
-            loss = loss + sparsity_w * sparsity
-        return loss
+    def decode (self, features):
+        return features @ self.decoder_weight.T
+
+
+
+# trains SAE from streaming activations of the model
+# assumes a sparsity_coeff is initalized at 1e-3
+def train_SAE (sae:SAE, activation, optimizer, target_active, sparsity_coeff):
+    features, combined_gate = sae.encode(activation)
+
+    error = (combined_gate.sum(-1) - target_active).mean()
+    sparsity_coeff *= (1 + 0.01 * ( 1 if error.item() > 0 else -1 ))
+    l0_loss = torch.clamp (error, min=0) * sparsity_coeff
+
+    pred = sae.decode(features)
+    recon_loss = (pred-activation).pow(2).sum(-1).mean()
+    loss = l0_loss + recon_loss
+
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+    # keep decoder feature columns uniform
+    with torch.no_grad():
+        sae.decoder_weight /= sae.decoder_weight.norm (dim = 0, keepdim = True)
+    return sparsity_coeff, loss.item(), l0_loss.item(), recon_loss.item()
